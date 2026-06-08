@@ -216,6 +216,12 @@ async function main(): Promise<void> {
 
   if (discord_connected) {
     await pool.resume_parked_bots();
+
+    // Repair bots that came back assigned-but-dead after the restart (issue #66).
+    // Runs after resume so legitimate resume candidates have already respawned;
+    // anything still assigned with no live tmux is a half-spawn that would
+    // silently drop every message to its channel.
+    await pool.reconcile_assigned_health();
   }
 
   // Initialize Commander (persistent Claude Code session with Discord channel)

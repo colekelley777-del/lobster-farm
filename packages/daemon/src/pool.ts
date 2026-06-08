@@ -1049,6 +1049,75 @@ export class BotPool extends EventEmitter {
     }
   }
 
+  /**
+   * Post-restart health check: repair bots that came back assigned-but-dead.
+   *
+   * The drain+restart cycle can leave a bot marked `assigned` to a channel with
+   * NO live tmux session behind it — typically when the bot's session was
+   * unconfirmed at drain time, so it persisted with `session=none` and never
+   * qualified as a resume candidate. The bot listens (access.json points at the
+   * channel) but no Claude process is running, so every message is silently
+   * dropped (issue #66).
+   *
+   * For each assigned bot whose `tmux has-session` check fails, we respawn a
+   * fresh session through the existing `restart_crashed_session()` path (which
+   * resumes a confirmed session when one exists, otherwise spawns fresh). If a
+   * bot can't be revived, we alert #alerts so the channel doesn't go silently
+   * dark.
+   *
+   * Call AFTER `resume_parked_bots()` so legitimate resume candidates have
+   * already had their chance — anything still assigned-but-dead here is a
+   * genuine half-spawn that needs repair.
+   */
+  async reconcile_assigned_health(): Promise<void> {
+    // Snapshot the bot list — restart_crashed_session() mutates state but never
+    // adds/removes bots, so this stays valid for the whole pass. A dead bot is
+    // only ever repaired once (it becomes assigned-with-live-tmux or freed).
+    const half_spawned = this.bots.filter(
+      (b) => b.state === "assigned" && b.channel_id && !this.is_tmux_alive(b.tmux_session),
+    );
+    if (half_spawned.length === 0) return;
+
+    console.warn(
+      `[pool] Post-restart health check: ${String(half_spawned.length)} assigned bot(s) have no live tmux — repairing`,
+    );
+
+    for (const bot of half_spawned) {
+      const entity_id = bot.entity_id;
+      const channel_id = bot.channel_id;
+      const archetype = bot.archetype;
+      console.warn(
+        `[pool] pool-${String(bot.id)} came back assigned with a dead tmux session ` +
+          `(channel: ${channel_id ?? "none"}, session: ${bot.session_id?.slice(0, 8) ?? "none"}) — respawning`,
+      );
+
+      // restart_crashed_session() owns the spawn path: it pre-flights the JSONL,
+      // resumes when possible, writes access.json, and alerts #alerts on success.
+      // On failure it frees the bot, so we detect that below to alert.
+      await this.restart_crashed_session(bot);
+
+      // If the bot is still assigned, the respawn succeeded. Otherwise it was
+      // freed by the restart-failure path and the channel is now dark — alert.
+      if (bot.state !== "assigned") {
+        const label = this.channel_label(entity_id, channel_id);
+        console.error(
+          `[pool] pool-${String(bot.id)} could not be revived after restart — channel ${label} is dark`,
+        );
+        try {
+          await notify(
+            "alerts",
+            `\ud83d\udd34 Pool bot ${String(bot.id)} (${archetype ?? "unknown"}) came back dead after restart and could not be revived for ${entity_id ?? "unknown"}/${label}. Channel is unattended — check daemon logs.`,
+            entity_id ? this.registry?.get(entity_id) : undefined,
+          );
+        } catch (notify_err) {
+          console.warn(
+            `[pool] Failed to alert #alerts for un-revivable pool-${String(bot.id)}: ${String(notify_err)}`,
+          );
+        }
+      }
+    }
+  }
+
   /** Assign a pool bot to a channel with a specific archetype.
    *
    * If `pending_message` is provided, the daemon writes it to a JSON file and
@@ -1961,14 +2030,11 @@ export class BotPool extends EventEmitter {
       });
 
       // Wrap notify separately — an alert failure should not undo a successful restart
-      const channel_label =
-        entity_config?.entity.channels.list.find((ch) => ch.id === channel_id)?.purpose ??
-        channel_id ??
-        entity_id;
+      const label = this.channel_label(entity_id, channel_id);
       try {
         await notify(
           "alerts",
-          `\u26a0\ufe0f Pool bot ${String(bot.id)} (${archetype}) crashed and was auto-restarted for ${entity_id}/${channel_label}`,
+          `\u26a0\ufe0f Pool bot ${String(bot.id)} (${archetype}) crashed and was auto-restarted for ${entity_id}/${label}`,
           entity_config,
         );
       } catch (notify_err) {
@@ -2053,14 +2119,11 @@ export class BotPool extends EventEmitter {
 
     // Alert outside the release/event flow — a notify() failure must not
     // prevent the crash_loop event or skip remaining bots in the health check.
-    const channel_label =
-      entity_config?.entity.channels.list.find((ch) => ch.id === channel_id)?.purpose ??
-      channel_id ??
-      "unknown";
+    const label = this.channel_label(entity_id, channel_id);
     try {
       await notify(
         "alerts",
-        `\ud83d\udd34 Pool bot ${String(bot.id)} crash loop detected for ${entity_id ?? "unknown"}/${channel_label} — released. Check daemon logs.`,
+        `\ud83d\udd34 Pool bot ${String(bot.id)} crash loop detected for ${entity_id ?? "unknown"}/${label} — released. Check daemon logs.`,
         entity_config,
       );
     } catch (notify_err) {
@@ -2650,6 +2713,17 @@ export class BotPool extends EventEmitter {
         }
       });
     });
+  }
+
+  /** Human-readable label for a channel in #alerts messages: the channel's
+   * configured purpose if known, else the raw id, else "unknown". */
+  private channel_label(entity_id: string | null, channel_id: string | null): string {
+    const entity_config = entity_id ? this.registry?.get(entity_id) : undefined;
+    return (
+      entity_config?.entity.channels.list.find((ch) => ch.id === channel_id)?.purpose ??
+      channel_id ??
+      "unknown"
+    );
   }
 
   /** Look up the github_token_ref for an entity from the registry.
