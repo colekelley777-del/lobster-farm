@@ -236,6 +236,133 @@ export async function wait_for_bot_ready_with_retries(
   return false;
 }
 
+// ── Keystroke injection with submit-race retry ──
+
+/**
+ * Full visible pane content, or `null` if the capture itself failed (dead/killed
+ * session, timeout). A failed read is NOT the same as a genuinely empty pane —
+ * callers must treat `null` as "indeterminate" and never infer submit success
+ * from it, or a dead session would silently mask a dropped message (#65).
+ */
+function capture_pane(tmux_session: string): string | null {
+  try {
+    return execFileSync("tmux", ["capture-pane", "-t", tmux_session, "-p"], {
+      encoding: "utf-8",
+      timeout: 2000,
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Inject a message into a tmux pane via send-keys and verify the submit landed.
+ *
+ * tmux `send-keys` for the message text and the subsequent Enter are racy: if
+ * the Enter arrives before the input is committed (or during a redraw), it's
+ * dropped and the text sits in the input box, unsubmitted — the agent never
+ * starts a turn and the message is silently lost (issue #65).
+ *
+ * After sending text + Enter, this polls the pane for a bounded window to
+ * confirm the turn actually started. A submit is considered confirmed when the
+ * pane shows an active-turn indicator ("esc to interrupt") OR the input box no
+ * longer contains the message text. If the text is still sitting unsubmitted
+ * after the poll window, a bare Enter is re-sent — up to `max_retries` times.
+ *
+ * Logs a warning whenever a retry was needed so submit-race frequency is
+ * measurable in the daemon logs.
+ *
+ * @param tmux_session - tmux session name (e.g., "pool-4")
+ * @param message - message text to type into the input box
+ * @param opts.poll_ms - poll interval while waiting for confirmation (default 200ms)
+ * @param opts.confirm_ms - how long to wait for confirmation per attempt (default 800ms)
+ * @param opts.max_retries - max bare-Enter retries after the initial submit (default 3)
+ * @returns true if the submit was confirmed, false if it remained unconfirmed
+ */
+export async function send_keys_with_submit_retry(
+  tmux_session: string,
+  message: string,
+  opts?: { poll_ms?: number; confirm_ms?: number; max_retries?: number },
+): Promise<boolean> {
+  const poll_ms = opts?.poll_ms ?? 200;
+  const confirm_ms = opts?.confirm_ms ?? 800;
+  const max_retries = opts?.max_retries ?? 3;
+
+  // Send the message text and the initial submit in one send-keys call. If the
+  // session died between the at-prompt check and now, this throws — log and
+  // treat as not-confirmed so the retry/give-up path handles it rather than
+  // aborting the surrounding health-check iteration mid-loop.
+  try {
+    execFileSync("tmux", ["send-keys", "-t", tmux_session, message, "Enter"], {
+      stdio: "ignore",
+      timeout: 5000,
+    });
+  } catch (err) {
+    console.warn(`[pool] Initial send-keys failed for ${tmux_session}: ${String(err)}`);
+    return false;
+  }
+
+  // A turn started if the status bar shows the active-generation indicator, or
+  // the input box no longer echoes the message text we just typed. Scan the
+  // whole pane — long input wraps across lines, so a last-line check would
+  // falsely report "submitted" for wrapped text still sitting in the box.
+  //
+  // A failed pane read (null) is indeterminate, NOT confirmed — returning true
+  // there would fail-open and silently mask a dropped message on a dead session.
+  // Warn once (not per-poll) so a dead session doesn't spam the log.
+  let warned_pane_read = false;
+  const submit_confirmed = (): boolean => {
+    const pane = capture_pane(tmux_session);
+    if (pane === null) {
+      if (!warned_pane_read) {
+        warned_pane_read = true;
+        console.warn(
+          `[pool] Pane read failed for ${tmux_session} — cannot confirm submit (treating as not confirmed)`,
+        );
+      }
+      return false;
+    }
+    if (pane.includes("esc to interrupt")) return true;
+    return !pane.includes(message);
+  };
+
+  for (let retry = 0; retry <= max_retries; retry++) {
+    const deadline = Date.now() + confirm_ms;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, poll_ms));
+      if (submit_confirmed()) {
+        if (retry > 0) {
+          console.warn(
+            `[pool] Submit confirmed for ${tmux_session} after ${String(retry)} retry(ies) — keystroke submit race`,
+          );
+        }
+        return true;
+      }
+    }
+
+    // Still unsubmitted after the poll window — re-send a bare Enter (bounded).
+    if (retry < max_retries) {
+      console.warn(
+        `[pool] Submit not confirmed for ${tmux_session} (text still in input box) — re-sending Enter (retry ${String(retry + 1)}/${String(max_retries)})`,
+      );
+      try {
+        execFileSync("tmux", ["send-keys", "-t", tmux_session, "Enter"], {
+          stdio: "ignore",
+          timeout: 5000,
+        });
+      } catch (err) {
+        console.warn(`[pool] Re-send Enter failed for ${tmux_session}: ${String(err)}`);
+        return false;
+      }
+    }
+  }
+
+  console.warn(
+    `[pool] Submit never confirmed for ${tmux_session} after ${String(max_retries)} retries — could not confirm submit (pane unreadable or input stuck, session may be dead); message may be dropped`,
+  );
+  return false;
+}
+
 // ── Claude Code JSONL session tracking ──
 
 /**
@@ -1587,7 +1714,7 @@ export class BotPool extends EventEmitter {
       this.cleanup_session_history();
 
       // Deliver any queued messages to bots that are now at the prompt
-      this.drain_pending_injections();
+      await this.drain_pending_injections();
 
       // Safety net: recover undelivered legacy .txt pending files left by
       // any older spawn path. The canonical SessionStart-hook injection
@@ -2649,7 +2776,19 @@ export class BotPool extends EventEmitter {
     }
 
     if (this.is_at_prompt(tmux_session)) {
-      this.send_via_tmux(tmux_session, message);
+      let confirmed: boolean;
+      try {
+        confirmed = await this.send_via_tmux(tmux_session, message);
+      } catch (err) {
+        console.warn(`[pool] Failed to inject message into ${tmux_session}: ${String(err)}`);
+        return false;
+      }
+      if (!confirmed) {
+        console.warn(
+          `[pool] Injected message into ${tmux_session} but submit not confirmed — message may be dropped`,
+        );
+        return false;
+      }
       console.log(`[pool] Injected message into ${tmux_session}`);
       return true;
     }
@@ -2685,16 +2824,16 @@ export class BotPool extends EventEmitter {
     }
   }
 
-  /** Send a message to a tmux session via send-keys. */
-  private send_via_tmux(session_name: string, message: string): void {
-    execFileSync("tmux", ["send-keys", "-t", session_name, message, "Enter"], {
-      stdio: "ignore",
-      timeout: 5000,
-    });
+  /** Send a message to a tmux session via send-keys, verifying the submit
+   * landed and retrying the Enter if the input box is left unsubmitted (#65).
+   * Returns true only when the submit was confirmed; false on exhausted
+   * retries or an unreadable pane (message likely dropped). */
+  private async send_via_tmux(session_name: string, message: string): Promise<boolean> {
+    return send_keys_with_submit_retry(session_name, message);
   }
 
   /** Drain queued messages for bots that are now at the prompt. Called from health check. */
-  private drain_pending_injections(): void {
+  private async drain_pending_injections(): Promise<void> {
     for (const [session, messages] of this.pending_injections) {
       if (!this.is_tmux_alive(session)) {
         this.pending_injections.delete(session);
@@ -2704,16 +2843,26 @@ export class BotPool extends EventEmitter {
         continue;
       }
       if (this.is_at_prompt(session)) {
+        let confirmed = 0;
         try {
           for (const message of messages) {
-            this.send_via_tmux(session, message);
+            if (await this.send_via_tmux(session, message)) confirmed++;
           }
-          this.pending_injections.delete(session);
-          console.log(
-            `[pool] Delivered ${String(messages.length)} queued message(s) to ${session}`,
-          );
         } catch (err) {
           console.warn(`[pool] Failed to deliver queued messages to ${session}: ${String(err)}`);
+        }
+        // Drop the queue regardless — the bounded submit retries are exhausted,
+        // and re-queueing a likely-dead session would just loop the same failure.
+        // Dead-session recovery is issue #66's job.
+        this.pending_injections.delete(session);
+        const failed = messages.length - confirmed;
+        if (confirmed > 0) {
+          console.log(`[pool] Delivered ${String(confirmed)} queued message(s) to ${session}`);
+        }
+        if (failed > 0) {
+          console.warn(
+            `[pool] ${String(failed)} queued message(s) to ${session} unconfirmed — may be dropped`,
+          );
         }
       }
       // Still busy — keep queued, will retry next cycle
@@ -2751,8 +2900,14 @@ export class BotPool extends EventEmitter {
       // Bot is ready with an undelivered pending file — deliver it
       try {
         const prompt = `A user messaged you earlier but the message wasn't delivered. Read ${pending_path} for their message and respond to them.`;
-        this.send_via_tmux(bot.tmux_session, prompt);
-        console.log(`[pool] Drained pending file for ${bot.tmux_session} via health check`);
+        const confirmed = await this.send_via_tmux(bot.tmux_session, prompt);
+        if (confirmed) {
+          console.log(`[pool] Drained pending file for ${bot.tmux_session} via health check`);
+        } else {
+          console.warn(
+            `[pool] Drained pending file for ${bot.tmux_session} but submit not confirmed — may be dropped`,
+          );
+        }
         // Clean up shortly after — Claude has the prompt and will read it within seconds.
         // Keep this well under the 30s health-check interval to prevent self-re-delivery
         // on the next tick.
