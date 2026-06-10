@@ -23,6 +23,8 @@ import type { BotPool, PoolBot } from "../pool.js";
 import {
   HEARTBEAT_COOLDOWN_MS,
   HEARTBEAT_PREFIX,
+  RELAY_DEDUP_MS,
+  RELAY_SUFFIX,
   REPLY_REMINDER,
   _reset_cooldown_for_tests,
   evaluate_stop,
@@ -370,6 +372,7 @@ describe("evaluate_stop — acceptance criteria", () => {
       called_reply: false,
       is_sidechain: false,
       tool_summary: "",
+      text_content: "",
       found: true,
       ...turn,
     });
@@ -619,5 +622,160 @@ describe("evaluate_stop — acceptance criteria", () => {
     );
     expect(result).toEqual({ ok: true });
     expect(sends.length).toBe(0);
+  });
+
+  // ── Auto-relay tests ──
+
+  it("auto-relay: stranded text → posts to channel with agent label + RELAY_SUFFIX", async () => {
+    const relays: Array<{ channel_id: string; content: string }> = [];
+    const result = await evaluate_stop(
+      { session_id, working_dir },
+      {
+        pool: bound_pool(),
+        discord: null,
+        read_turn: make_turn_reader({
+          produced_text: true,
+          called_reply: false,
+          text_content: "Here is the answer you asked for.",
+        }),
+        send_relay: async (cid, content) => {
+          relays.push({ channel_id: cid, content });
+        },
+      },
+    );
+    // Still blocks + reminds so agent can retry cleanly.
+    expect(result).toEqual({ ok: true, block: true, reminder: REPLY_REMINDER });
+    expect(relays).toHaveLength(1);
+    expect(relays[0].channel_id).toBe("C123");
+    expect(relays[0].content).toContain("Here is the answer you asked for.");
+    expect(relays[0].content).toContain(RELAY_SUFFIX);
+    // bound_pool() has archetype null (make_bot default), so label falls back to "Agent"
+    // Format is **Label:** text  (colon is inside the bold)
+    expect(relays[0].content).toMatch(/^\*\*Agent:\*\* /);
+  });
+
+  it("auto-relay: empty text_content → no send, still block", async () => {
+    const relays: Array<{ channel_id: string; content: string }> = [];
+    const result = await evaluate_stop(
+      { session_id, working_dir },
+      {
+        pool: bound_pool(),
+        discord: null,
+        read_turn: make_turn_reader({
+          produced_text: true,
+          called_reply: false,
+          text_content: "   ",
+        }),
+        send_relay: async (cid, content) => {
+          relays.push({ channel_id: cid, content });
+        },
+      },
+    );
+    expect(result).toEqual({ ok: true, block: true, reminder: REPLY_REMINDER });
+    expect(relays).toHaveLength(0);
+  });
+
+  it("auto-relay: dedup — second stranded turn within window → no second relay", async () => {
+    const relays: Array<{ channel_id: string; content: string }> = [];
+    let now = 1_000_000;
+    const deps = {
+      pool: bound_pool(),
+      discord: null,
+      now: () => now,
+      read_turn: make_turn_reader({
+        produced_text: true,
+        called_reply: false,
+        text_content: "An answer.",
+      }),
+      send_relay: async (cid: string, content: string) => {
+        relays.push({ channel_id: cid, content });
+      },
+    };
+
+    await evaluate_stop({ session_id, working_dir }, deps);
+    expect(relays).toHaveLength(1);
+
+    // 30s later — within the 60s dedup window.
+    now += 30_000;
+    expect(now - 1_000_000).toBeLessThan(RELAY_DEDUP_MS);
+    await evaluate_stop({ session_id, working_dir }, deps);
+    expect(relays).toHaveLength(1); // no second relay
+
+    // After dedup window expires, relay fires again.
+    now += RELAY_DEDUP_MS + 1;
+    await evaluate_stop({ session_id, working_dir }, deps);
+    expect(relays).toHaveLength(2);
+  });
+
+  it("auto-relay: archetype planner → label is Percival", async () => {
+    const pool_with_archetype = make_pool([
+      make_bot({
+        id: 1,
+        state: "assigned",
+        channel_id: "C123",
+        entity_id: "lobster-farm",
+        session_id,
+        archetype: "planner",
+      }),
+    ]);
+    const relays: Array<{ channel_id: string; content: string }> = [];
+    await evaluate_stop(
+      { session_id, working_dir },
+      {
+        pool: pool_with_archetype,
+        discord: null,
+        read_turn: make_turn_reader({
+          produced_text: true,
+          called_reply: false,
+          text_content: "Plans are afoot.",
+        }),
+        send_relay: async (cid, content) => {
+          relays.push({ channel_id: cid, content });
+        },
+      },
+    );
+    expect(relays).toHaveLength(1);
+    expect(relays[0].content).toMatch(/^\*\*Percival:\*\* /);
+  });
+
+  it("auto-relay: send_relay throws → fail open (block still fires, no throw)", async () => {
+    const result = await evaluate_stop(
+      { session_id, working_dir },
+      {
+        pool: bound_pool(),
+        discord: null,
+        read_turn: make_turn_reader({
+          produced_text: true,
+          called_reply: false,
+          text_content: "Some answer.",
+        }),
+        send_relay: async () => {
+          throw new Error("discord send exploded");
+        },
+      },
+    );
+    // Fail open — block still fires.
+    expect(result).toEqual({ ok: true, block: true, reminder: REPLY_REMINDER });
+  });
+
+  it("auto-relay: unbound session → no relay, no error", async () => {
+    const relays: Array<{ channel_id: string; content: string }> = [];
+    const result = await evaluate_stop(
+      { session_id, working_dir },
+      {
+        pool: unbound_pool(),
+        discord: null,
+        read_turn: make_turn_reader({
+          produced_text: true,
+          called_reply: false,
+          text_content: "Stranded but unbound.",
+        }),
+        send_relay: async (cid, content) => {
+          relays.push({ channel_id: cid, content });
+        },
+      },
+    );
+    expect(result).toEqual({ ok: true });
+    expect(relays).toHaveLength(0);
   });
 });

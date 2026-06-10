@@ -61,6 +61,12 @@ export interface TurnSummary {
    * used by the heartbeat generator. May be empty when the turn was pure text.
    */
   tool_summary: string;
+  /**
+   * Full concatenated text from all non-empty text blocks in the last
+   * assistant turn. Used by the auto-relay safety net to post the stranded
+   * text to Discord when the agent forgot to call `reply`.
+   */
+  text_content: string;
   /** True if a transcript was found and parsed. False = no JSONL on disk yet. */
   found: boolean;
 }
@@ -76,12 +82,24 @@ export interface EvaluateStopDeps {
   read_turn?: (working_dir: string, session_id: string) => Promise<TurnSummary>;
   /** Override Haiku heartbeat generator for tests. */
   make_heartbeat?: (turn: TurnSummary) => Promise<string>;
+  /**
+   * Override Discord send for tests. When set, auto-relay uses this instead
+   * of `deps.discord.send`. Signature matches `DiscordBot.send`.
+   */
+  send_relay?: (channel_id: string, content: string) => Promise<void>;
 }
 
 // ── Cooldown ──
 
 /** Default per-channel heartbeat cooldown (ms). */
 export const HEARTBEAT_COOLDOWN_MS = 60_000;
+
+/**
+ * Per-channel auto-relay dedup window (ms). If the safety net fired for a
+ * channel within this window, skip posting again to avoid duplicate messages
+ * when the block-and-remind loop fires repeatedly on the same content.
+ */
+export const RELAY_DEDUP_MS = 60_000;
 
 interface CooldownEntry {
   channel_id: string;
@@ -92,9 +110,13 @@ interface CooldownEntry {
  * are skipped on subsequent silent turns. */
 const heartbeat_cooldown = new Map<string, CooldownEntry>();
 
+/** Per-channel dedup map for auto-relay. Keyed by channel_id. */
+const relay_dedup = new Map<string, CooldownEntry>();
+
 /** Reset cooldowns. Test-only. */
 export function _reset_cooldown_for_tests(): void {
   heartbeat_cooldown.clear();
+  relay_dedup.clear();
 }
 
 function in_cooldown(channel_id: string, now: number): boolean {
@@ -157,6 +179,7 @@ export async function read_last_assistant_turn(
       called_reply: false,
       is_sidechain: false,
       tool_summary: "",
+      text_content: "",
       found: false,
     };
   }
@@ -203,10 +226,12 @@ export function parse_last_assistant_turn(jsonl_content: string): TurnSummary {
     let produced_text = false;
     let called_reply = false;
     const tool_names: string[] = [];
+    const text_parts: string[] = [];
 
     for (const block of content) {
       if (block.type === "text" && typeof block.text === "string" && block.text.trim() !== "") {
         produced_text = true;
+        text_parts.push(block.text);
       }
       if (block.type === "tool_use" && typeof block.name === "string") {
         tool_names.push(block.name);
@@ -221,6 +246,7 @@ export function parse_last_assistant_turn(jsonl_content: string): TurnSummary {
       called_reply,
       is_sidechain: entry.isSidechain === true,
       tool_summary: tool_names.join(", "),
+      text_content: text_parts.join("\n\n"),
       found: true,
     };
   }
@@ -230,6 +256,7 @@ export function parse_last_assistant_turn(jsonl_content: string): TurnSummary {
     called_reply: false,
     is_sidechain: false,
     tool_summary: "",
+    text_content: "",
     found: false,
   };
 }
@@ -303,6 +330,40 @@ export const REPLY_REMINDER =
   "You produced assistant text but did not route it to Discord. Call the `reply` tool now with the user-facing portion of your last response. The user only sees what `reply` sends.";
 
 /**
+ * Suffix appended to auto-relayed messages so users know it was the daemon,
+ * not the agent, that posted — and so we can track when the safety net fires.
+ */
+export const RELAY_SUFFIX = " 🤖 *auto-relayed*";
+
+/**
+ * Display names for each archetype role. Mirrors pool.ts
+ * `resolve_agent_display_name` but kept local to avoid cross-module coupling.
+ */
+const ARCHETYPE_DISPLAY: Record<string, string> = {
+  planner: "Percival",
+  designer: "Galahad",
+  builder: "Bedivere",
+  reviewer: "Reviewer",
+  operator: "Bors",
+  commander: "Commander",
+};
+
+/**
+ * Resolve the full assigned PoolBot for a session, if one exists. Returns null
+ * when the session is unbound. Used by auto-relay to get both channel_id and
+ * archetype (for attribution) in a single lookup.
+ */
+export function resolve_bound_bot(session_id: string, pool: BotPool | null) {
+  if (!pool) return null;
+  for (const bot of pool.get_assigned_bots()) {
+    if (bot.session_id === session_id && bot.channel_id) {
+      return bot;
+    }
+  }
+  return null;
+}
+
+/**
  * Evaluate a Stop hook fire. Returns the response payload the HTTP handler
  * should send back to the hook script.
  *
@@ -323,10 +384,12 @@ export async function evaluate_stop(
 
   // Step 1: Discord-bound check is cheap — do it first to short-circuit
   // pass-through cases (subagents, CLI agents, queue tasks).
-  const channel_id = resolve_bound_channel(session_id, deps.pool);
-  if (!channel_id) {
+  const bound_bot = resolve_bound_bot(session_id, deps.pool);
+  if (!bound_bot) {
     return { ok: true };
   }
+  const channel_id = bound_bot.channel_id!;
+  const archetype = bound_bot.archetype;
 
   // Step 2: parse the last assistant turn from the JSONL tail.
   let turn: TurnSummary;
@@ -361,7 +424,47 @@ export async function evaluate_stop(
 
   // Step 3: decide.
   if (turn.produced_text && !turn.called_reply) {
-    // Failure mode (a): hard enforce.
+    // Failure mode (a): stranded text. Belt-and-suspenders:
+    //   1. Auto-relay the text to Discord so the user sees it regardless.
+    //   2. Also block with a reminder so the agent retries properly.
+    //
+    // The relay fires even when blocking alone has failed to recover the agent
+    // (as seen in tonight's pool-0 incident — 3 consecutive silent turns).
+    const now = now_fn();
+    const in_relay_dedup = (relay_dedup.get(channel_id)?.last_at ?? 0) + RELAY_DEDUP_MS > now;
+
+    if (!in_relay_dedup && turn.text_content.trim()) {
+      const send_fn =
+        deps.send_relay ??
+        ((cid: string, content: string) =>
+          deps.discord ? deps.discord.send(cid, content) : Promise.resolve());
+
+      const agent_label =
+        archetype && ARCHETYPE_DISPLAY[archetype] ? ARCHETYPE_DISPLAY[archetype] : "Agent";
+
+      const relay_content = `**${agent_label}:** ${turn.text_content.trim()}${RELAY_SUFFIX}`;
+
+      try {
+        await send_fn(channel_id, relay_content);
+        relay_dedup.set(channel_id, { channel_id, last_at: now });
+        console.log(
+          `[reply-enforce] auto-relayed stranded text for ${session_id.slice(0, 8)} → ${channel_id} (${agent_label})`,
+        );
+      } catch (err) {
+        // Relay send failed — log and continue. The block+reminder still fires
+        // so the agent has a chance to retry on its own.
+        console.warn(
+          `[reply-enforce] auto-relay send failed for ${session_id.slice(0, 8)}: ${String(err)}`,
+        );
+        sentry.addBreadcrumb({
+          category: "reply-enforce",
+          level: "warning",
+          message: "auto-relay send failed",
+          data: { session_id: session_id.slice(0, 8), channel_id, err: String(err) },
+        });
+      }
+    }
+
     return { ok: true, block: true, reminder: REPLY_REMINDER };
   }
 
