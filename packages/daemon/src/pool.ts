@@ -1,7 +1,7 @@
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { access, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
+import { access, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ArchetypeRole, LobsterFarmConfig } from "@lobster-farm/shared";
@@ -321,6 +321,8 @@ function resolve_agent_name(archetype: ArchetypeRole, config: LobsterFarmConfig)
       return config.agents.operator.name.toLowerCase();
     case "commander":
       return config.agents.commander.name.toLowerCase();
+    case "marketer":
+      return config.agents.marketer.name.toLowerCase();
     case "reviewer":
       return "reviewer";
   }
@@ -338,6 +340,8 @@ function resolve_agent_display_name(archetype: ArchetypeRole, config: LobsterFar
       return config.agents.operator.name;
     case "commander":
       return config.agents.commander.name;
+    case "marketer":
+      return config.agents.marketer.name;
     case "reviewer":
       return "Reviewer";
   }
@@ -1095,6 +1099,19 @@ export class BotPool extends EventEmitter {
       // Update access.json with the channel ID. Pass entity_id so the
       // entity's #alerts channel is also added to the outbound allowlist (#40).
       await this.write_access_json(bot.state_dir, channel_id, entity_id);
+
+      // Prune any foreign entity channels from the bot's access.json that
+      // may have been over-granted by a prior buggy backfill. Only the
+      // assigned channel and the entity's alerts channel belong in the groups
+      // map; everything else from the same entity is removed. Non-fatal.
+      try {
+        await this.ensure_entity_channels_allowlisted(bot.state_dir, entity_id, channel_id);
+      } catch (err) {
+        console.warn(
+          `[pool] ensure_entity_channels_allowlisted failed for pool-${String(bot.id)}: ${String(err)}`,
+        );
+        // Non-fatal: the bot can still function on its primary channel.
+      }
 
       // Set Discord nickname and profile avatar to match the archetype
       await this.set_bot_nickname(bot, archetype);
@@ -2194,6 +2211,112 @@ export class BotPool extends EventEmitter {
     if (!entity_config) return null;
     const alerts_channel = entity_config.entity.channels.list.find((ch) => ch.type === "alerts");
     return alerts_channel?.id ?? null;
+  }
+
+  /**
+   * Reconcile a pool bot's `access.json.groups` on assignment so that exactly
+   * two entity channels are present:
+   *   1. The bot's **assigned channel** — `requireMention: false` (already
+   *      written by `write_access_json`; this method is a no-op for it).
+   *   2. The entity's **alerts channel** — `requireMention: true` (already
+   *      written by `write_access_json`; this method is a no-op for it).
+   *
+   * All other same-entity channels are **removed** from the groups map if
+   * they are present (self-healing drift from the previous over-granting bug).
+   * Channels belonging to other entities or channels not in the entity config
+   * are left untouched.
+   *
+   * Invariants:
+   *   - The assigned channel entry is never touched (it was written by
+   *     `write_access_json` with the correct policy).
+   *   - The alerts channel entry is never touched (same).
+   *   - dmPolicy and top-level allowFrom are never modified.
+   *   - Only called for pool bots, never for infrastructure bots.
+   *
+   * Cross-room awareness (e.g., letting the marketer bot read #general) is
+   * intentional design and must be expressed explicitly — not implied by the
+   * entity config membership.
+   */
+  async ensure_entity_channels_allowlisted(
+    state_dir: string,
+    entity_id: string,
+    assigned_channel_id?: string,
+  ): Promise<void> {
+    if (!this.registry) return;
+    const entity_config = this.registry.get(entity_id);
+    if (!entity_config) return;
+
+    const all_entity_channel_ids = new Set(entity_config.entity.channels.list.map((ch) => ch.id));
+    if (all_entity_channel_ids.size === 0) return;
+
+    // The two channels that belong in the groups map — anything else from
+    // this entity is a foreign channel and must be pruned.
+    const alerts_channel_id = this.resolve_alerts_channel_id(entity_id);
+    const permitted = new Set<string>();
+    if (assigned_channel_id) permitted.add(assigned_channel_id);
+    if (alerts_channel_id) permitted.add(alerts_channel_id);
+
+    const target = join(state_dir, "access.json");
+
+    // Read current access.json. Tolerate ENOENT (write_access_json always runs
+    // before this, so the file should exist — but guard defensively).
+    let raw: string;
+    try {
+      raw = await readFile(target, "utf-8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw err;
+    }
+
+    let access_data: Record<string, unknown>;
+    try {
+      access_data = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      // Corrupt file — write_access_json handles recovery for the canonical
+      // assign path; here we bail to avoid overwriting a partially-recovered file.
+      console.warn(
+        `[pool] ensure_entity_channels_allowlisted: corrupt access.json at ${target} — skipping`,
+      );
+      return;
+    }
+
+    const groups = (access_data.groups ?? {}) as Record<
+      string,
+      { requireMention: boolean; allowFrom: string[] }
+    >;
+
+    // Identify entity channels in the groups map that are NOT the assigned
+    // channel or the alerts channel — these are foreign and must be removed.
+    const to_remove = Object.keys(groups).filter(
+      (id) => all_entity_channel_ids.has(id) && !permitted.has(id),
+    );
+
+    if (to_remove.length === 0) return;
+
+    for (const id of to_remove) {
+      delete groups[id];
+    }
+    access_data.groups = groups;
+
+    // Atomic write: tmp + rename. Same pattern as
+    // CommanderProcess.ensure_channel_allowlisted so a torn write never
+    // leaves the plugin staring at a half-written file.
+    const tmp = `${target}.tmp.${randomUUID()}`;
+    try {
+      await writeFile(tmp, `${JSON.stringify(access_data, null, 2)}\n`, { mode: 0o600 });
+      await rename(tmp, target);
+    } catch (err) {
+      try {
+        await unlink(tmp);
+      } catch {
+        /* ignore cleanup failure */
+      }
+      throw err;
+    }
+
+    console.log(
+      `[pool] Pruned ${String(to_remove.length)} foreign entity channel(s) from access.json for ${entity_id}: ${to_remove.join(", ")}`,
+    );
   }
 
   /**

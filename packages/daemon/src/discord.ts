@@ -240,6 +240,12 @@ interface ChannelEntry {
   assigned_feature?: string | null;
   /** Human-readable purpose from entity config (e.g., "aws", "io-site"). */
   purpose?: string;
+  /**
+   * Optional archetype override from the entity's channel config.
+   * When present, incoming messages to this channel auto-assign a pool bot
+   * running as this archetype instead of the default "planner".
+   */
+  assigned_archetype?: ArchetypeRole;
 }
 
 // ── Command target abstraction ──
@@ -1470,12 +1476,19 @@ export class DiscordBot extends EventEmitter {
     }
 
     const agents = this.config.agents;
+
+    // Build name lookup defensively: if a new archetype was added to the
+    // enum but the config agent entry is missing (e.g., shared dist not
+    // yet rebuilt), fall back to the archetype string rather than throwing.
+    // This prevents a single unmapped archetype from killing message handling
+    // across the entire daemon.
     const names: Record<string, string> = {
-      planner: agents.planner.name,
-      designer: agents.designer.name,
-      builder: agents.builder.name,
-      operator: agents.operator.name,
-      commander: agents.commander.name,
+      planner: agents.planner?.name ?? "Planner",
+      designer: agents.designer?.name ?? "Designer",
+      builder: agents.builder?.name ?? "Builder",
+      operator: agents.operator?.name ?? "Operator",
+      commander: agents.commander?.name ?? "Commander",
+      marketer: agents.marketer?.name ?? "Tristan",
       reviewer: "Reviewer",
     };
 
@@ -1537,6 +1550,7 @@ export class DiscordBot extends EventEmitter {
       agents.builder.name.toLowerCase(),
       agents.operator.name.toLowerCase(),
       agents.commander.name.toLowerCase(),
+      agents.marketer.name.toLowerCase(),
     ];
 
     // Discover avatar files on disk
@@ -2443,6 +2457,7 @@ export class DiscordBot extends EventEmitter {
         this.channel_map.set(channel.id, {
           entity_id,
           channel_type: channel.type,
+          assigned_archetype: channel.assigned_archetype,
         });
 
         // For send_to_entity, store the first channel of each type
@@ -2608,8 +2623,10 @@ export class DiscordBot extends EventEmitter {
       }
 
       if (!assignment) {
-        // Default to planner archetype for new auto-assigned sessions
-        const archetype: ArchetypeRole = "planner";
+        // Use the channel's configured archetype override if present, otherwise
+        // default to planner. This lets work_room channels (e.g., #marketing)
+        // spawn a specific archetype (e.g., marketer) without a /swap.
+        const archetype: ArchetypeRole = entry.assigned_archetype ?? "planner";
 
         // Show the user we're working on it
         try {

@@ -7,6 +7,7 @@ export const ArchetypeRoleSchema = z.enum([
   "reviewer",
   "operator",
   "commander",
+  "marketer",
 ]);
 export type ArchetypeRole = z.infer<typeof ArchetypeRoleSchema>;
 

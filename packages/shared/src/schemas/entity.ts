@@ -1,5 +1,10 @@
 import { z } from "zod";
-import { ChannelTypeSchema, EntityStatusSchema, RepoStructureSchema } from "./enums.js";
+import {
+  ArchetypeRoleSchema,
+  ChannelTypeSchema,
+  EntityStatusSchema,
+  RepoStructureSchema,
+} from "./enums.js";
 
 export const ChannelMappingSchema = z.object({
   type: ChannelTypeSchema,
@@ -7,6 +12,14 @@ export const ChannelMappingSchema = z.object({
   purpose: z.string().optional(),
   assigned_feature: z.string().nullable().optional(),
   dynamic: z.boolean().optional(),
+  /**
+   * Optional archetype override for this channel.
+   * When set on a work_room channel, incoming messages auto-assign a pool bot
+   * running as this archetype instead of defaulting to "planner".
+   * Example: a #marketing channel sets assigned_archetype: marketer to
+   * route messages to Tristan instead of Gary.
+   */
+  assigned_archetype: ArchetypeRoleSchema.optional(),
 });
 export type ChannelMapping = z.infer<typeof ChannelMappingSchema>;
 

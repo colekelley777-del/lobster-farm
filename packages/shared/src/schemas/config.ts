@@ -83,6 +83,7 @@ export const LobsterFarmConfigSchema = z.object({
       builder: AgentNameSchema.default({ name: "Bob" }),
       operator: AgentNameSchema.default({ name: "Ray" }),
       commander: AgentNameSchema.default({ name: "Pat" }),
+      marketer: AgentNameSchema.default({ name: "Tristan" }),
     })
     .default({}),
 

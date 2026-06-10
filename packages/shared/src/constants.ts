@@ -51,6 +51,13 @@ export const DEFAULT_ARCHETYPES: Record<ArchetypeRole, ArchetypeDefaults> = {
     primary_dna: "commander-dna",
     additional_dna: [],
   },
+  marketer: {
+    default_name: "Tristan",
+    model: "opus",
+    think: "high",
+    primary_dna: "marketing-dna",
+    additional_dna: [],
+  },
 } as const;
 
 export const DEFAULT_SOPS = [
