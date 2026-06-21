@@ -116,11 +116,16 @@ describe("send_keys_with_submit_retry", () => {
   it("re-sends Enter when text sits unsubmitted, then succeeds", async () => {
     // First confirm window: text still in the box. After the retry Enter, the
     // turn starts → confirmed.
+    //
+    // With confirm_ms=150 and poll_ms=100 two polls happen per window (at
+    // 100ms and 200ms). A baseline pane read happens BEFORE the initial
+    // send, so the sequence is: [baseline, poll-1, poll-2, retry-poll-1].
     const m = mock_pane(
       [
-        `❯ ${MSG}`, // poll 1 — still unsubmitted
-        `❯ ${MSG}`, // poll 2 — still unsubmitted (window expires → retry Enter)
-        "✶ Working… (esc to interrupt)", // poll 3 — turn started
+        `❯ ${MSG}`, // baseline (pre-send) — baseline_was_running=false
+        `❯ ${MSG}`, // poll 1 (100ms) — still unsubmitted
+        `❯ ${MSG}`, // poll 2 (200ms) — still unsubmitted (window expires → retry)
+        "✶ Working… (esc to interrupt)", // retry poll 1 — turn started
       ],
       MSG,
     );
@@ -139,7 +144,8 @@ describe("send_keys_with_submit_retry", () => {
 
   it("logs a warning when a retry was needed", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const m = mock_pane([`❯ ${MSG}`, `❯ ${MSG}`, "esc to interrupt"], MSG);
+    // Same layout as above: baseline + 2 window-0 polls (both stuck) + retry poll
+    const m = mock_pane([`❯ ${MSG}`, `❯ ${MSG}`, `❯ ${MSG}`, "esc to interrupt"], MSG);
 
     const p = send_keys_with_submit_retry("pool-4", MSG, {
       poll_ms: 100,
@@ -207,5 +213,63 @@ describe("send_keys_with_submit_retry", () => {
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("Pane read failed"));
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("could not confirm submit"));
     warn.mockRestore();
+  });
+
+  // ── Baseline false-positive hardening (issue #316) ──
+
+  it("does NOT false-positive when 'esc to interrupt' was ALREADY in the pane before send (prior turn)", async () => {
+    // Scenario: a prior turn's "esc to interrupt" is still showing when
+    // send_keys_with_submit_retry is called.  The first pane read (for the
+    // baseline) sees the indicator.  Post-send pane ALSO shows it — but our
+    // message text is still in the box, unsubmitted.
+    //
+    // Old code: returned true immediately (false positive — the prior turn's
+    // indicator counted as confirmation).
+    // New code: baseline_was_running = true → "esc to interrupt" alone is not
+    // enough; we also require the message text to have cleared.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let call_count = 0;
+    (execFileSync as Mock).mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === "tmux" && args[0] === "send-keys") return "";
+      if (cmd === "tmux" && args[0] === "capture-pane") {
+        call_count++;
+        // Baseline (call 0 — before send): prior turn running
+        if (call_count === 1) return "✶ Thinking… (esc to interrupt)\n❯ ";
+        // Post-send polls: prior turn STILL running, our text now in box
+        if (call_count <= 3) return `✶ Still going… (esc to interrupt)\n❯ ${MSG}`;
+        // Eventually our turn starts (text cleared, new "esc to interrupt")
+        return "✶ New turn (esc to interrupt)";
+      }
+      return "";
+    });
+
+    const p = send_keys_with_submit_retry("pool-4", MSG, {
+      poll_ms: 100,
+      confirm_ms: 150,
+      max_retries: 3,
+    });
+    await vi.advanceTimersByTimeAsync(3000);
+    // Should eventually confirm once the text clears (new turn), not on the first poll
+    expect(await p).toBe(true);
+    warn.mockRestore();
+  });
+
+  it("confirms immediately when 'esc to interrupt' appears freshly (baseline was NOT running)", async () => {
+    // Baseline: bot was at prompt (no "esc to interrupt"). Post-send: turn
+    // started — "esc to interrupt" is fresh confirmation (not a pre-existing one).
+    let call_count = 0;
+    (execFileSync as Mock).mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === "tmux" && args[0] === "send-keys") return "";
+      if (cmd === "tmux" && args[0] === "capture-pane") {
+        call_count++;
+        if (call_count === 1) return "❯ "; // baseline: at prompt, no prior turn
+        return "✶ Thinking… (esc to interrupt)";
+      }
+      return "";
+    });
+
+    const p = send_keys_with_submit_retry("pool-4", MSG, { poll_ms: 50, confirm_ms: 400 });
+    await vi.advanceTimersByTimeAsync(500);
+    expect(await p).toBe(true);
   });
 });

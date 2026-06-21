@@ -54,6 +54,37 @@ export function is_discord_snowflake(id: string): boolean {
   return /^\d{17,20}$/.test(id);
 }
 
+/**
+ * Extract the text currently typed into Claude Code's input box from a tmux
+ * pane capture.
+ *
+ * Claude Code renders the input prompt as "❯ <text>" on the last visible line.
+ * Returns the trimmed text after the prompt, or null if:
+ *   - the pane is null (unreadable)
+ *   - no prompt line is found
+ *   - the prompt line is empty (nothing typed)
+ *   - the bot is actively generating ("esc to interrupt" present) — in that
+ *     case there is no input box to be stuck
+ *
+ * Exported for unit testing.
+ */
+export function extract_prompt_input(pane: string | null): string | null {
+  if (pane === null) return null;
+  // Never consider input stuck while a turn is actively running
+  if (pane.includes("esc to interrupt")) return null;
+  const lines = pane.split("\n");
+  // Scan from the bottom — the prompt is always on the last visible line
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i] ?? "";
+    const idx = line.indexOf("❯ ");
+    if (idx !== -1) {
+      const text = line.slice(idx + 2).trim();
+      return text.length > 0 ? text : null;
+    }
+  }
+  return null;
+}
+
 // ── Member-management errors (#308) ──
 //
 // Routes layer maps these to HTTP responses; carrying them as typed errors
@@ -779,6 +810,20 @@ export class DiscordBot extends EventEmitter {
     const started_at = Date.now();
     const GRACE_PERIOD_MS = 15_000;
 
+    // Stuck-input watchdog state.
+    // If the bot is idle AND there is non-empty text sitting in the input box
+    // for more than one consecutive poll cycle, the MCP plugin delivered the
+    // text but the Enter was dropped — re-send it.
+    // Invariants:
+    //   - only fires when idle (never interrupts an active turn)
+    //   - requires the same text to persist across ≥2 polls (≥4 s) to avoid
+    //     acting on text that is still mid-delivery
+    //   - deduplicates: tracks the last text we rescued so we never re-submit
+    //     the same stuck run twice
+    //   - clears if the text changes (user typed something new) or disappears
+    let watchdog_prev_stuck_text: string | null = null;
+    let watchdog_last_rescued_text: string | null = null;
+
     const interval = setInterval(() => {
       if (!this._pool) {
         this.stop_typing_loop(channel_id);
@@ -826,19 +871,65 @@ export class DiscordBot extends EventEmitter {
         // The tmux pane shows "← discord" when the channel plugin is pushing
         // a message — if that indicator is present near the end of the pane
         // alongside a prompt, the bot is about to receive work.
+        //
+        // We also run the stuck-input watchdog here: if the bot is idle AND
+        // the prompt line has non-empty input text that persisted across two
+        // consecutive polls, the MCP plugin typed the message but the Enter
+        // was dropped — re-send it.
+        let pane_for_idle_checks: string | null = null;
         try {
-          const pane = execFileSync(
+          pane_for_idle_checks = execFileSync(
             "tmux",
             ["capture-pane", "-t", bot.tmux_session, "-p", "-S", "-5"],
             { encoding: "utf-8", timeout: 2000 },
           );
-          if (pane.includes("← discord")) {
-            consecutive_idle = 0;
-            void this.update_status_embed_from_tmux(channel_id, bot.tmux_session);
-            return;
-          }
         } catch {
           // tmux read failure — fall through to normal idle logic
+        }
+
+        if (pane_for_idle_checks?.includes("← discord")) {
+          consecutive_idle = 0;
+          watchdog_prev_stuck_text = null;
+          void this.update_status_embed_from_tmux(channel_id, bot.tmux_session);
+          return;
+        }
+
+        // Stuck-input watchdog: extract the prompt-line text.
+        // Claude Code renders the input box as "❯ <text>" on the last line.
+        // We look for a line that starts with "❯ " and extract whatever follows.
+        // Empty prompt ("❯ " with nothing after) means no pending input — skip.
+        const stuck_text = extract_prompt_input(pane_for_idle_checks);
+        if (
+          stuck_text !== null &&
+          stuck_text === watchdog_prev_stuck_text &&
+          stuck_text !== watchdog_last_rescued_text
+        ) {
+          // Same non-empty text seen for two consecutive idle polls — Enter dropped.
+          console.warn(
+            `[discord] Stuck input detected for ${bot.tmux_session} — re-sending Enter to unblock ("${stuck_text.slice(0, 60)}${stuck_text.length > 60 ? "…" : ""}")`,
+          );
+          watchdog_last_rescued_text = stuck_text;
+          watchdog_prev_stuck_text = null;
+          try {
+            execFileSync("tmux", ["send-keys", "-t", bot.tmux_session, "Enter"], {
+              stdio: "ignore",
+              timeout: 5000,
+            });
+          } catch (err) {
+            console.warn(
+              `[discord] Watchdog Enter re-send failed for ${bot.tmux_session}: ${String(err)}`,
+            );
+          }
+          // Reset idle counter — we just submitted, the bot will become active
+          consecutive_idle = 0;
+          void this.update_status_embed_from_tmux(channel_id, bot.tmux_session);
+          return;
+        }
+        // Update watchdog state for next poll
+        if (stuck_text !== null && stuck_text !== watchdog_last_rescued_text) {
+          watchdog_prev_stuck_text = stuck_text;
+        } else {
+          watchdog_prev_stuck_text = null;
         }
 
         consecutive_idle++;
@@ -849,6 +940,7 @@ export class DiscordBot extends EventEmitter {
         }
       } else {
         consecutive_idle = 0;
+        watchdog_prev_stuck_text = null;
       }
 
       // Parse tmux output and update the status embed if activity changed

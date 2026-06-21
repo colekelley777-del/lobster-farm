@@ -288,6 +288,13 @@ export async function send_keys_with_submit_retry(
   const confirm_ms = opts?.confirm_ms ?? 800;
   const max_retries = opts?.max_retries ?? 3;
 
+  // Capture a baseline pane state BEFORE the initial send.  If the session is
+  // already mid-turn (prior "esc to interrupt" still showing), we must NOT treat
+  // that pre-existing indicator as confirmation that OUR message submitted.
+  // A null baseline is non-fatal — the submit_confirmed() logic degrades safely.
+  const baseline_pane = capture_pane(tmux_session);
+  const baseline_was_running = baseline_pane?.includes("esc to interrupt");
+
   // Send the message text and the initial submit in one send-keys call. If the
   // session died between the at-prompt check and now, this throws — log and
   // treat as not-confirmed so the retry/give-up path handles it rather than
@@ -310,6 +317,11 @@ export async function send_keys_with_submit_retry(
   // A failed pane read (null) is indeterminate, NOT confirmed — returning true
   // there would fail-open and silently mask a dropped message on a dead session.
   // Warn once (not per-poll) so a dead session doesn't spam the log.
+  //
+  // False-positive guard: if "esc to interrupt" was ALREADY in the pane when we
+  // sent (baseline_was_running), that indicator belongs to the prior turn — it
+  // cannot confirm our submit.  In that case we require the input box to have
+  // actually cleared (message text gone) before declaring success.
   let warned_pane_read = false;
   const submit_confirmed = (): boolean => {
     const pane = capture_pane(tmux_session);
@@ -322,7 +334,7 @@ export async function send_keys_with_submit_retry(
       }
       return false;
     }
-    if (pane.includes("esc to interrupt")) return true;
+    if (pane.includes("esc to interrupt") && !baseline_was_running) return true;
     return !pane.includes(message);
   };
 
