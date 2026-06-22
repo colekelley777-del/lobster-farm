@@ -212,7 +212,11 @@ export async function generate_settings(path_overrides?: Partial<PathConfig>): P
           hooks: [
             {
               type: "command",
-              command: `bash -c 'REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0; FILE=$(echo "$TOOL_INPUT" | jq -r ".file_path // empty"); case "$FILE" in "$REPO_ROOT"/*) ;; *) exit 0;; esac; BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || exit 0; if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then echo "BLOCK: Direct edits to $BRANCH are not allowed. Create a feature branch first." >&2; exit 2; fi'`,
+              // tool_input comes from the hook's stdin JSON. The old $TOOL_INPUT
+              // env var was dropped by CLI v2.1.185, which silently turned this
+              // branch-protection check into a no-op (FILE was always empty, so
+              // the repo-path guard never matched and every edit was allowed).
+              command: `bash -c 'IN=$(cat); FILE=$(printf "%s" "$IN" | jq -r ".tool_input.file_path // empty"); REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0; case "$FILE" in "$REPO_ROOT"/*) ;; *) exit 0;; esac; BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || exit 0; if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then echo "BLOCK: Direct edits to $BRANCH are not allowed. Create a feature branch first." >&2; exit 2; fi'`,
             },
           ],
         },
@@ -221,8 +225,11 @@ export async function generate_settings(path_overrides?: Partial<PathConfig>): P
           hooks: [
             {
               type: "command",
+              // tool_input comes from the hook's stdin JSON. The old $TOOL_INPUT
+              // env var was dropped by CLI v2.1.185, which silently turned this
+              // secret scan into a no-op (it was grepping an empty string).
               command:
-                'bash -c \'if echo "$TOOL_INPUT" | grep -qiE "(sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{36,}|AKIA[A-Z0-9]{16}|xox[bpras]-[a-zA-Z0-9-]+|-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----)"; then echo "BLOCK: Detected potential hardcoded secret in tool input." >&2; exit 2; fi\'',
+                'bash -c \'IN=$(cat); if printf "%s" "$IN" | grep -qiE "(sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{36,}|AKIA[A-Z0-9]{16}|xox[bpras]-[a-zA-Z0-9-]+|-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----)"; then echo "BLOCK: Detected potential hardcoded secret in tool input." >&2; exit 2; fi\'',
             },
           ],
         },
@@ -256,9 +263,15 @@ export async function generate_settings(path_overrides?: Partial<PathConfig>): P
               // unreachable), exit 0 — a wedged daemon must never wedge an
               // agent.
               command:
+                // session_id/cwd come from the hook's stdin JSON (the stable
+                // interface). The old $CLAUDE_SESSION_ID env var was dropped by
+                // CLI v2.1.185, which silently broke session confirmation.
+                "IN=$(cat); SID=$(printf '%s' \"$IN\" | jq -r '.session_id // empty'); " +
+                '[ -z "$SID" ] && SID="${CLAUDE_CODE_SESSION_ID:-}"; ' +
+                "CWD=$(printf '%s' \"$IN\" | jq -r '.cwd // empty'); [ -z \"$CWD\" ] && CWD=\"$(pwd)\"; " +
                 "RESP=$(curl -s -X POST http://localhost:7749/hooks/stop " +
                 "-H 'Content-Type: application/json' " +
-                '-d \'{"session_id": "\'"$CLAUDE_SESSION_ID"\'", "working_dir": "\'"$(pwd)"\'"}\' 2>/dev/null) || exit 0; ' +
+                '-d "{\\"session_id\\": \\"$SID\\", \\"working_dir\\": \\"$CWD\\"}" 2>/dev/null) || exit 0; ' +
                 "if echo \"$RESP\" | jq -e '.block == true' >/dev/null 2>&1; then " +
                 "echo \"$RESP\" | jq -r '.reminder' >&2; " +
                 "exit 2; " +
