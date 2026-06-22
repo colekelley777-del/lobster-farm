@@ -80,6 +80,12 @@ export interface EvaluateStopDeps {
   now?: () => number;
   /** Override transcript reader for tests. */
   read_turn?: (working_dir: string, session_id: string) => Promise<TurnSummary>;
+  /**
+   * Override extended transcript reader for tests. Used when the bound bot has
+   * `session_confirmed === false` (first-turn cold-start), which means the JSONL
+   * may not be on disk yet when the Stop hook fires.
+   */
+  read_turn_extended?: (working_dir: string, session_id: string) => Promise<TurnSummary>;
   /** Override Haiku heartbeat generator for tests. */
   make_heartbeat?: (turn: TurnSummary) => Promise<string>;
   /**
@@ -132,26 +138,16 @@ function mark_cooldown(channel_id: string, now: number): void {
 // ── Transcript parsing ──
 
 /**
- * Locate and read the last assistant turn from a session's JSONL transcript.
+ * Core JSONL reader with configurable retry delays.
  *
- * Mitigates the transcript-tail flush race: Claude Code writes the JSONL
- * asynchronously, so the Stop hook may fire before the last events have hit
- * disk. We retry with a short backoff up to ~250ms.
+ * Retries reading the JSONL file at the given delay intervals (ms between
+ * attempts). Returns empty string when the file never materialised within
+ * the budget — the caller maps this to `found: false`.
  *
- * Returns `found: false` when the transcript does not exist yet (e.g. brand
- * new session) — the caller treats this as "pass through, nothing to enforce".
+ * Settles early once the file size stabilises across two consecutive reads
+ * (single stat syscall per attempt via readFile length comparison).
  */
-export async function read_last_assistant_turn(
-  working_dir: string,
-  session_id: string,
-): Promise<TurnSummary> {
-  const path = claude_session_jsonl_path(working_dir, session_id);
-
-  // Brief retry loop to mitigate the JSONL flush race: Claude Code writes the
-  // transcript asynchronously, so the Stop hook may fire before the last
-  // events have hit disk. Retry with backoff, capped at ~250ms total. Settle
-  // early once the file size stops growing — single syscall per attempt.
-  const delays = [0, 50, 100, 100];
+async function read_jsonl_with_delays(path: string, delays: number[]): Promise<string> {
   let last_size = -1;
   let content = "";
 
@@ -167,12 +163,33 @@ export async function read_last_assistant_turn(
       continue;
     }
     if (next.length === last_size) {
+      // Size stabilised — flush is complete.
       break;
     }
     last_size = next.length;
     content = next;
   }
 
+  return content;
+}
+
+/**
+ * Locate and read the last assistant turn from a session's JSONL transcript.
+ *
+ * Mitigates the transcript-tail flush race: Claude Code writes the JSONL
+ * asynchronously, so the Stop hook may fire before the last events have hit
+ * disk. Retry with backoff, capped at ~250ms total.
+ *
+ * Returns `found: false` when the transcript does not exist yet (e.g. brand
+ * new session) — the caller treats this as "pass through, nothing to enforce".
+ */
+export async function read_last_assistant_turn(
+  working_dir: string,
+  session_id: string,
+): Promise<TurnSummary> {
+  const path = claude_session_jsonl_path(working_dir, session_id);
+  // [0, 50, 100, 100] → up to ~250ms total, 4 attempts.
+  const content = await read_jsonl_with_delays(path, [0, 50, 100, 100]);
   if (!content) {
     return {
       produced_text: false,
@@ -183,8 +200,48 @@ export async function read_last_assistant_turn(
       found: false,
     };
   }
-
   return parse_last_assistant_turn(content);
+}
+
+/**
+ * Extended-retry transcript reader for first-turn sessions.
+ *
+ * On a brand-new pool-bot session the JSONL is created lazily by Claude Code
+ * during the first turn. The standard 250ms retry window is often not enough
+ * for the initial write to reach disk by the time the Stop hook fires.
+ *
+ * This variant adds up to ~2 000ms of additional polling (five 400ms steps)
+ * before giving up — appropriate only when we know the session is new
+ * (session_confirmed === false on the bound PoolBot) and is Discord-bound.
+ *
+ * Returns `found: false` when the JSONL still hasn't appeared after the full
+ * budget — caller treats this as fail-open pass-through, same as the standard
+ * reader.
+ */
+export async function read_last_assistant_turn_extended(
+  working_dir: string,
+  session_id: string,
+): Promise<TurnSummary> {
+  const path = claude_session_jsonl_path(working_dir, session_id);
+  // Phase 1: same fast window as the standard reader (~250ms).
+  const fast = await read_jsonl_with_delays(path, [0, 50, 100, 100]);
+  if (fast) return parse_last_assistant_turn(fast);
+
+  // Phase 2: extended window — five 400ms steps (~2 000ms more).
+  // Only reached when the JSONL wasn't on disk after the fast phase, which
+  // happens on cold-start first turns where Claude writes lazily.
+  const slow = await read_jsonl_with_delays(path, [400, 400, 400, 400, 400]);
+  if (!slow) {
+    return {
+      produced_text: false,
+      called_reply: false,
+      is_sidechain: false,
+      tool_summary: "",
+      text_content: "",
+      found: false,
+    };
+  }
+  return parse_last_assistant_turn(slow);
 }
 
 interface JsonlEntry {
@@ -380,6 +437,7 @@ export async function evaluate_stop(
   const { session_id, working_dir } = args;
   const now_fn = deps.now ?? Date.now;
   const read_turn = deps.read_turn ?? read_last_assistant_turn;
+  const read_turn_ext = deps.read_turn_extended ?? read_last_assistant_turn_extended;
   const make_heartbeat = deps.make_heartbeat ?? generate_heartbeat;
 
   // Step 1: Discord-bound check is cheap — do it first to short-circuit
@@ -417,9 +475,47 @@ export async function evaluate_stop(
   }
 
   if (!turn.found) {
-    // No transcript on disk yet (or empty). Pass through — there is nothing
-    // to enforce against.
-    return { ok: true };
+    // The JSONL wasn't on disk within the standard retry window (~250ms).
+    //
+    // For a brand-new Discord-bound session (session_confirmed === false) the
+    // JSONL is created lazily during the first turn — the Stop hook can fire
+    // before the file reaches disk, causing the first reply to be silently
+    // dropped.  Engage the extended reader (up to ~2s more of polling) to give
+    // the write time to land before falling through.
+    //
+    // For confirmed sessions this path should be rare; we still fail open to
+    // avoid blocking the agent on a transient filesystem glitch.
+    if (!bound_bot.session_confirmed) {
+      try {
+        const extended_turn = await read_turn_ext(working_dir, session_id);
+        if (extended_turn.found) {
+          turn = extended_turn;
+          // Fall through to Step 3 with the recovered turn.
+        } else {
+          // Still not found after extended wait. Fail open — better to miss
+          // enforcement once than to block the agent indefinitely.
+          console.warn(
+            `[reply-enforce] JSONL not found after extended wait for new session ${session_id.slice(0, 8)} — failing open`,
+          );
+          sentry.addBreadcrumb({
+            category: "reply-enforce",
+            level: "warning",
+            message: "JSONL missing after extended wait on new session",
+            data: { session_id: session_id.slice(0, 8), channel_id },
+          });
+          return { ok: true };
+        }
+      } catch (err) {
+        // Extended read failed — still fail open.
+        console.warn(
+          `[reply-enforce] extended transcript read failed for ${session_id.slice(0, 8)}: ${String(err)}`,
+        );
+        return { ok: true };
+      }
+    } else {
+      // Confirmed session — no transcript on disk (or empty). Pass through.
+      return { ok: true };
+    }
   }
 
   // Step 3: decide.

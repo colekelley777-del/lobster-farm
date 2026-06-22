@@ -31,6 +31,7 @@ import {
   is_discord_bound,
   parse_last_assistant_turn,
   read_last_assistant_turn,
+  read_last_assistant_turn_extended,
   resolve_bound_channel,
 } from "../reply-enforcement.js";
 import type { TurnSummary } from "../reply-enforcement.js";
@@ -777,5 +778,440 @@ describe("evaluate_stop — acceptance criteria", () => {
     );
     expect(result).toEqual({ ok: true });
     expect(relays).toHaveLength(0);
+  });
+});
+
+// ── First-turn / cold-start recovery (the "first reply vanishes" bug) ──
+
+describe("first-turn cold-start: JSONL not yet on disk when Stop hook fires", () => {
+  const session_id = "first-turn-session";
+  const working_dir = "/tmp/wd-first-turn";
+
+  /**
+   * Pool with a brand-new bot (session_confirmed === false) — simulates a
+   * cold-start where the JSONL hasn't been observed on disk yet.
+   */
+  function new_session_pool(): BotPool {
+    return make_pool([
+      make_bot({
+        id: 2,
+        state: "assigned",
+        channel_id: "C-first",
+        entity_id: "lobster-farm",
+        session_id,
+        session_confirmed: false,
+      }),
+    ]);
+  }
+
+  /**
+   * Pool with a confirmed bot — JSONL was previously seen. Used to verify
+   * the extended-retry path is NOT taken for confirmed sessions.
+   */
+  function confirmed_pool(): BotPool {
+    return make_pool([
+      make_bot({
+        id: 3,
+        state: "assigned",
+        channel_id: "C-confirmed",
+        entity_id: "lobster-farm",
+        session_id,
+        session_confirmed: true,
+      }),
+    ]);
+  }
+
+  // ── Core regression test ──
+
+  it("first turn, JSONL never appears → extended reader invoked, relay fires once", async () => {
+    // read_turn (standard) → found: false
+    // read_turn_extended   → found: true, stranded text
+    // Expected: auto-relay posts exactly once, block+reminder returned.
+    const relays: Array<{ channel_id: string; content: string }> = [];
+
+    const result = await evaluate_stop(
+      { session_id, working_dir },
+      {
+        pool: new_session_pool(),
+        discord: null,
+        read_turn: async () => ({
+          produced_text: false,
+          called_reply: false,
+          is_sidechain: false,
+          tool_summary: "",
+          text_content: "",
+          found: false,
+        }),
+        read_turn_extended: async () => ({
+          produced_text: true,
+          called_reply: false,
+          is_sidechain: false,
+          tool_summary: "",
+          text_content: "Hello from the first turn!",
+          found: true,
+        }),
+        send_relay: async (cid, content) => {
+          relays.push({ channel_id: cid, content });
+        },
+      },
+    );
+
+    expect(result).toEqual({ ok: true, block: true, reminder: REPLY_REMINDER });
+    expect(relays).toHaveLength(1);
+    expect(relays[0].channel_id).toBe("C-first");
+    expect(relays[0].content).toContain("Hello from the first turn!");
+    expect(relays[0].content).toContain(RELAY_SUFFIX);
+  });
+
+  // ── JSONL flushes after extended delay — relay fires once, never twice ──
+
+  it("first turn, JSONL appears during extended retry → relayed once, not duplicated", async () => {
+    // Simulates: standard reader returns found:false, extended reader finds it.
+    // dedup window must prevent a second relay if Stop fires again quickly.
+    const relays: Array<{ channel_id: string; content: string }> = [];
+    let now = 2_000_000;
+    const deps = {
+      pool: new_session_pool(),
+      discord: null,
+      now: () => now,
+      read_turn: async (): Promise<TurnSummary> => ({
+        produced_text: false,
+        called_reply: false,
+        is_sidechain: false,
+        tool_summary: "",
+        text_content: "",
+        found: false,
+      }),
+      read_turn_extended: async (): Promise<TurnSummary> => ({
+        produced_text: true,
+        called_reply: false,
+        is_sidechain: false,
+        tool_summary: "",
+        text_content: "Delayed first reply.",
+        found: true,
+      }),
+      send_relay: async (cid: string, content: string) => {
+        relays.push({ channel_id: cid, content });
+      },
+    };
+
+    // First Stop hook fire — relay should post.
+    await evaluate_stop({ session_id, working_dir }, deps);
+    expect(relays).toHaveLength(1);
+
+    // Second Stop fire within dedup window — must NOT post again.
+    now += 10_000; // 10s later, well inside 60s dedup window
+    expect(now - 2_000_000).toBeLessThan(RELAY_DEDUP_MS);
+    await evaluate_stop({ session_id, working_dir }, deps);
+    expect(relays).toHaveLength(1);
+  });
+
+  // ── Bot called reply → no auto-relay (no double-post) ──
+
+  it("first turn, bot called reply → no auto-relay regardless of session_confirmed", async () => {
+    // If the bot DID call reply, extended reader finds that — no relay should fire.
+    const relays: Array<{ channel_id: string; content: string }> = [];
+
+    const result = await evaluate_stop(
+      { session_id, working_dir },
+      {
+        pool: new_session_pool(),
+        discord: null,
+        read_turn: async () => ({
+          produced_text: false,
+          called_reply: false,
+          is_sidechain: false,
+          tool_summary: "",
+          text_content: "",
+          found: false,
+        }),
+        read_turn_extended: async () => ({
+          produced_text: true,
+          called_reply: true, // bot did call reply
+          is_sidechain: false,
+          tool_summary: "mcp__plugin_discord_discord__reply",
+          text_content: "Properly routed.",
+          found: true,
+        }),
+        send_relay: async (cid, content) => {
+          relays.push({ channel_id: cid, content });
+        },
+      },
+    );
+
+    // Normal pass-through: no block, no relay.
+    expect(result).toEqual({ ok: true });
+    expect(relays).toHaveLength(0);
+  });
+
+  // ── Confirmed session: extended reader NOT engaged ──
+
+  it("confirmed session with found:false → extended reader NOT called, fail open", async () => {
+    // For a confirmed session the standard found:false path should simply pass
+    // through without invoking the expensive extended reader.
+    let extended_called = false;
+
+    const result = await evaluate_stop(
+      { session_id, working_dir },
+      {
+        pool: confirmed_pool(),
+        discord: null,
+        read_turn: async () => ({
+          produced_text: false,
+          called_reply: false,
+          is_sidechain: false,
+          tool_summary: "",
+          text_content: "",
+          found: false,
+        }),
+        read_turn_extended: async () => {
+          extended_called = true;
+          return {
+            produced_text: true,
+            called_reply: false,
+            is_sidechain: false,
+            tool_summary: "",
+            text_content: "Should not be seen.",
+            found: true,
+          };
+        },
+        send_relay: async () => {
+          throw new Error("should not be called");
+        },
+      },
+    );
+
+    expect(result).toEqual({ ok: true });
+    expect(extended_called).toBe(false);
+  });
+
+  // ── Extended reader also returns found:false → fail open, no crash ──
+
+  it("first turn, extended reader also returns found:false → fail open, no relay", async () => {
+    // Even when both readers give up, we must not throw or block the agent.
+    const relays: Array<{ channel_id: string; content: string }> = [];
+
+    const result = await evaluate_stop(
+      { session_id, working_dir },
+      {
+        pool: new_session_pool(),
+        discord: null,
+        read_turn: async () => ({
+          produced_text: false,
+          called_reply: false,
+          is_sidechain: false,
+          tool_summary: "",
+          text_content: "",
+          found: false,
+        }),
+        read_turn_extended: async () => ({
+          produced_text: false,
+          called_reply: false,
+          is_sidechain: false,
+          tool_summary: "",
+          text_content: "",
+          found: false,
+        }),
+        send_relay: async (cid, content) => {
+          relays.push({ channel_id: cid, content });
+        },
+      },
+    );
+
+    expect(result).toEqual({ ok: true });
+    expect(relays).toHaveLength(0);
+  });
+
+  // ── Extended reader throws → fail open, no crash ──
+
+  it("first turn, extended reader throws → fail open gracefully", async () => {
+    const result = await evaluate_stop(
+      { session_id, working_dir },
+      {
+        pool: new_session_pool(),
+        discord: null,
+        read_turn: async () => ({
+          produced_text: false,
+          called_reply: false,
+          is_sidechain: false,
+          tool_summary: "",
+          text_content: "",
+          found: false,
+        }),
+        read_turn_extended: async () => {
+          throw new Error("extended read exploded");
+        },
+        send_relay: async () => {
+          throw new Error("should not be called");
+        },
+      },
+    );
+
+    expect(result).toEqual({ ok: true });
+  });
+
+  // ── Non-Discord-bound new session → no-op ──
+
+  it("first turn, unbound session → no extended reader call, no relay", async () => {
+    // Even brand-new sessions that aren't Discord-bound should be ignored
+    // entirely — the pool check is the first gate.
+    let extended_called = false;
+    const relays: Array<{ channel_id: string; content: string }> = [];
+
+    const unbound = make_pool([
+      make_bot({
+        id: 4,
+        state: "assigned",
+        channel_id: "C-other",
+        entity_id: "lobster-farm",
+        session_id: "different-session",
+        session_confirmed: false,
+      }),
+    ]);
+
+    const result = await evaluate_stop(
+      { session_id, working_dir },
+      {
+        pool: unbound,
+        discord: null,
+        read_turn: async () => ({
+          produced_text: false,
+          called_reply: false,
+          is_sidechain: false,
+          tool_summary: "",
+          text_content: "",
+          found: false,
+        }),
+        read_turn_extended: async () => {
+          extended_called = true;
+          return {
+            produced_text: true,
+            called_reply: false,
+            is_sidechain: false,
+            tool_summary: "",
+            text_content: "Should not relay.",
+            found: true,
+          };
+        },
+        send_relay: async (cid, content) => {
+          relays.push({ channel_id: cid, content });
+        },
+      },
+    );
+
+    expect(result).toEqual({ ok: true });
+    expect(extended_called).toBe(false);
+    expect(relays).toHaveLength(0);
+  });
+
+  // ── Dedup window: repeated silent new-session turns don't spam ──
+
+  it("repeated first-turn stranded turns within dedup window → relay fires only once", async () => {
+    const relays: Array<{ channel_id: string; content: string }> = [];
+    let now = 3_000_000;
+
+    const deps = {
+      pool: new_session_pool(),
+      discord: null,
+      now: () => now,
+      read_turn: async (): Promise<TurnSummary> => ({
+        produced_text: false,
+        called_reply: false,
+        is_sidechain: false,
+        tool_summary: "",
+        text_content: "",
+        found: false,
+      }),
+      read_turn_extended: async (): Promise<TurnSummary> => ({
+        produced_text: true,
+        called_reply: false,
+        is_sidechain: false,
+        tool_summary: "",
+        text_content: "Stranded first turn.",
+        found: true,
+      }),
+      send_relay: async (cid: string, content: string) => {
+        relays.push({ channel_id: cid, content });
+      },
+    };
+
+    // Turn 1 — relay fires.
+    await evaluate_stop({ session_id, working_dir }, deps);
+    expect(relays).toHaveLength(1);
+
+    // Turn 2 within dedup window — no second relay.
+    now += 5_000;
+    await evaluate_stop({ session_id, working_dir }, deps);
+    expect(relays).toHaveLength(1);
+
+    // Turn 3 within dedup window — still no relay.
+    now += 5_000;
+    await evaluate_stop({ session_id, working_dir }, deps);
+    expect(relays).toHaveLength(1);
+
+    // After dedup window — relay may fire again.
+    now += RELAY_DEDUP_MS + 1;
+    await evaluate_stop({ session_id, working_dir }, deps);
+    expect(relays).toHaveLength(2);
+  });
+});
+
+// ── read_last_assistant_turn_extended (filesystem, extended retry) ──
+
+describe("read_last_assistant_turn_extended", () => {
+  let original_home: string | undefined;
+  let temp_home: string;
+  let working_dir: string;
+  let session_id: string;
+
+  beforeEach(async () => {
+    original_home = process.env.HOME;
+    temp_home = await mkdtemp(join(tmpdir(), "lf-stop-hook-ext-"));
+    process.env.HOME = temp_home;
+
+    working_dir = "/tmp/some-cwd-ext";
+    session_id = "22222222-2222-2222-2222-222222222222";
+
+    const project_dir = join(temp_home, ".claude", "projects", encode_project_slug(working_dir));
+    await mkdir(project_dir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    if (original_home !== undefined) {
+      process.env.HOME = original_home;
+    } else {
+      delete process.env.HOME;
+    }
+    await rm(temp_home, { recursive: true, force: true });
+  });
+
+  it("returns found=false when JSONL still does not exist after extended wait", async () => {
+    const turn = await read_last_assistant_turn_extended(working_dir, session_id);
+    // Both fast and slow phases exhausted — file never appeared.
+    // This test is slow by design (~2.25s) — it validates the full budget.
+    // Marked with a generous timeout via the test itself.
+    expect(turn.found).toBe(false);
+    expect(turn.produced_text).toBe(false);
+  }, 10_000 /* allow up to 10s for the extended retry budget */);
+
+  it("recovers JSONL that materialises during the extended window", async () => {
+    const path = join(
+      temp_home,
+      ".claude",
+      "projects",
+      encode_project_slug(working_dir),
+      `${session_id}.jsonl`,
+    );
+
+    // Write the file 600ms after the call begins — after the fast phase (~250ms)
+    // but within the extended phase.
+    setTimeout(() => {
+      void writeFile(path, `${assistant_line({ text: "late first turn" })}\n`, "utf-8");
+    }, 600);
+
+    const turn = await read_last_assistant_turn_extended(working_dir, session_id);
+    expect(turn.found).toBe(true);
+    expect(turn.produced_text).toBe(true);
+    expect(turn.text_content).toContain("late first turn");
   });
 });
