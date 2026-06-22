@@ -941,6 +941,10 @@ export class DiscordBot extends EventEmitter {
       } else {
         consecutive_idle = 0;
         watchdog_prev_stuck_text = null;
+        // Clear the rescued-text dedupe as well: once the bot runs an active turn,
+        // any future identical stuck text is a genuinely new stuck message that
+        // needs rescuing — not a stale loop from the previous delivery.
+        watchdog_last_rescued_text = null;
       }
 
       // Parse tmux output and update the status embed if activity changed

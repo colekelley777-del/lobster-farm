@@ -400,6 +400,102 @@ describe("start_typing_loop — stuck-input watchdog (#316)", () => {
   });
 });
 
+it("rescues again after active turn clears the dedupe (rescue → active → same text → rescued again)", () => {
+  // Sequence:
+  //   1. Text "hello" is stuck → rescued (watchdog_last_rescued_text = "hello")
+  //   2. Bot becomes active (else-branch runs) → watchdog_last_rescued_text must reset to null
+  //   3. Same text "hello" arrives stuck again → must be rescued a second time
+  //
+  // Without the fix (watchdog_last_rescued_text not cleared in the else-branch),
+  // step 3 would be silently suppressed by the stale dedupe — the bug Lancelot flagged.
+  const config = make_config();
+  const registry = new EntityRegistry(config);
+  const bot = new TestDiscordBot(config, registry);
+
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+  // Phase control: start idle (stuck), then active, then idle (stuck same text) again.
+  // idle_phase tracks which phase we're in:
+  //   0 = stuck "hello" (rescue happens here)
+  //   1 = active turn (clears dedupe)
+  //   2 = stuck "hello" again (second rescue should fire)
+  let idle_phase = 0;
+  let capture_call = 0;
+
+  const pool: BotPool = {
+    get_assignment: vi.fn().mockImplementation(() => make_pool_bot()),
+    is_bot_idle: vi.fn().mockImplementation(() => idle_phase !== 1),
+    has_stale_oauth: vi.fn().mockReturnValue(false),
+    kill_stale_session: vi.fn(),
+    release_with_history: vi.fn().mockResolvedValue(undefined),
+    set_nickname_handler: vi.fn(),
+    set_avatar_handler: vi.fn(),
+    on: vi.fn().mockReturnThis(),
+  } as unknown as BotPool;
+
+  (execFileSync as Mock).mockImplementation((cmd: string, args: string[]) => {
+    if (cmd === "tmux" && args[0] === "capture-pane") {
+      capture_call++;
+      // Phase 0: polls 1+2 → stuck text (rescue fires on poll 2)
+      // Phase 1: active turn — is_bot_idle returns false, pane not read by watchdog path
+      // Phase 2: polls back in idle → stuck same text again
+      if (idle_phase === 0 || idle_phase === 2) return "❯ hello\n";
+      return "❯ "; // should not be reached during active phase
+    }
+    return "";
+  });
+
+  bot.set_pool(pool);
+  bot.start_typing_loop("test-channel");
+
+  // The 16s advance fires ticks at 4s,8s,12s,16s. The first three are within the
+  // 15s grace period. The tick at 16s is the first post-grace idle poll (poll 1):
+  // stuck text "hello" is stored in watchdog_prev_stuck_text but Enter is NOT sent yet
+  // (rescue requires the same text across ≥2 consecutive polls).
+  vi.advanceTimersByTime(16000);
+
+  let send_calls = (execFileSync as Mock).mock.calls.filter(
+    (c) => c[0] === "tmux" && c[1][0] === "send-keys",
+  );
+  expect(send_calls.length).toBe(0); // poll 1: text stored, no rescue yet
+
+  // Poll 2: same text still stuck → first rescue fires, Enter re-sent
+  vi.advanceTimersByTime(4000);
+  send_calls = (execFileSync as Mock).mock.calls.filter(
+    (c) => c[0] === "tmux" && c[1][0] === "send-keys",
+  );
+  expect(send_calls.length).toBe(1);
+  expect(warn).toHaveBeenCalledWith(expect.stringContaining("Stuck input detected"));
+  warn.mockClear();
+
+  // Phase 1: bot becomes active (is_bot_idle returns false → else-branch fires).
+  // Without the fix, watchdog_last_rescued_text would remain "hello", blocking a
+  // future rescue of identical text. The fix clears it here.
+  idle_phase = 1;
+  vi.advanceTimersByTime(4000); // one active-turn tick — else-branch clears dedupe
+
+  // Phase 2: bot goes idle again with the same stuck text "hello"
+  idle_phase = 2;
+
+  // Poll 1 of phase 2: text stored again in watchdog_prev_stuck_text
+  vi.advanceTimersByTime(4000);
+  send_calls = (execFileSync as Mock).mock.calls.filter(
+    (c) => c[0] === "tmux" && c[1][0] === "send-keys",
+  );
+  expect(send_calls.length).toBe(1); // still just the first rescue
+
+  // Poll 2 of phase 2: same text again → second rescue must fire
+  // (would be suppressed without the fix because last_rescued_text still = "hello")
+  vi.advanceTimersByTime(4000);
+  send_calls = (execFileSync as Mock).mock.calls.filter(
+    (c) => c[0] === "tmux" && c[1][0] === "send-keys",
+  );
+  expect(send_calls.length).toBe(2); // second rescue
+  expect(warn).toHaveBeenCalledWith(expect.stringContaining("Stuck input detected"));
+
+  warn.mockRestore();
+});
+
 // ── Watchdog does not interfere with arrival at prompt (happy path) ──
 
 describe("start_typing_loop — watchdog does not interfere with normal at-prompt delivery", () => {
